@@ -7,7 +7,7 @@ export class LinkedinService {
     'full stack developer',
     'data scientist',
     'product manager',
-    // ... Add up to 100 keywords
+
     'software engineer',
     'machine learning engineer',
     'devops engineer',
@@ -25,13 +25,12 @@ export class LinkedinService {
     'systems administrator',
     'QA engineer',
     'technical writer',
-    // Continue adding up to 100 keywords
   ];
 
   private readonly MAX_JOBS_PER_KEYWORD = 200;
-  private readonly JOBS_PER_PAGE = 25; // LinkedIn displays 25 jobs per page
-  private readonly MAX_JOB_AGE_DAYS = 30; // Filter out jobs older than 30 days
-  private readonly MAX_CONCURRENT_PAGES = 5; // Limit for concurrent job detail pages
+  private readonly JOBS_PER_PAGE = 25;
+  private readonly MAX_JOB_AGE_DAYS = 30;
+  private readonly MAX_CONCURRENT_PAGES = 5;
 
   private async launchBrowser(): Promise<puppeteer.Browser> {
     return await puppeteer.launch({
@@ -48,10 +47,8 @@ export class LinkedinService {
 
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
 
-    // Wait for jobs to load
     await page.waitForSelector('.job-search-card');
 
-    // Collect job hrefs
     const jobHrefs = await page.evaluate(() => {
       const jobElements = document.querySelectorAll('.job-search-card');
       const jobData: string[] = [];
@@ -92,7 +89,7 @@ export class LinkedinService {
         const company = companyTag ? companyTag.textContent.trim() : 'Not specified';
         const companyHref = companyTag ? companyTag.getAttribute('href') : 'Not specified';
         const location = getTextContent('.topcard__flavor--bullet, .top-card-layout__first-subline');
-        const address = getTextContent('.top-card-layout__second-subline'); // New: Address
+        const address = getTextContent('.top-card-layout__second-subline');
         const applicants = getTextContent('.num-applicants__caption');
         const postedBefore = getTextContent('.posted-time-ago__text, .topcard__flavor--metadata');
         const easyApply = !!document.querySelector('.apply-button');
@@ -116,7 +113,7 @@ export class LinkedinService {
         };
       });
 
-      jobDetails['href'] = jobHref; // Store the job URL
+      jobDetails['href'] = jobHref;
       return jobDetails;
     } catch (error) {
       console.error(`Error scraping job at: ${jobHref} - ${error}`);
@@ -168,7 +165,6 @@ export class LinkedinService {
     return filteredJobs;
   }
 
-  // Helper function to process an array with limited concurrency
   private async processWithConcurrencyLimit<T>(items: T[], limit: number, asyncFn: (item: T) => Promise<any>): Promise<any[]> {
     const results: any[] = [];
     let index = 0;
@@ -186,10 +182,8 @@ export class LinkedinService {
       }
     };
 
-    // Create an array of worker promises
     const workers = Array.from({ length: limit }, () => execute());
 
-    // Wait for all workers to finish
     await Promise.all(workers);
 
     return results;
@@ -211,18 +205,15 @@ export class LinkedinService {
           try {
             const jobHrefs = await this.getJobHrefs(page, keyword, start);
 
-            // Remove duplicates
             const newJobHrefs = jobHrefs.filter((href) => !keywordJobs.some((job) => job.href === href));
 
             if (newJobHrefs.length === 0) {
-              // No new jobs found, break the loop
               console.log(`No more new jobs found for keyword "${keyword}" at start ${start}.`);
               break;
             }
 
             console.log(`Found ${newJobHrefs.length} new job(s) for keyword "${keyword}".`);
 
-            // Scrape job details with controlled concurrency
             const jobDetailsArray = await this.processWithConcurrencyLimit(newJobHrefs, this.MAX_CONCURRENT_PAGES, (href) => this.scrapeJobDetails(href, browser));
 
             keywordJobs.push(...jobDetailsArray);
@@ -231,7 +222,6 @@ export class LinkedinService {
 
             console.log(`Collected ${jobsCollected} jobs for keyword "${keyword}".`);
 
-            // Optional delay to prevent rate limiting
             await new Promise((resolve) => setTimeout(resolve, 2000));
           } catch (error) {
             console.error(`Error processing keyword "${keyword}" at start ${start}: ${error}`);
@@ -241,11 +231,9 @@ export class LinkedinService {
           }
         }
 
-        // Filter out old jobs
         const filteredJobs = this.filterOldJobs(keywordJobs);
         console.log(`After filtering, ${filteredJobs.length} jobs remain for keyword "${keyword}".`);
 
-        // Categorize by country
         const categorizedJobs = this.categorizeByCountry(filteredJobs);
 
         allJobs.push({
