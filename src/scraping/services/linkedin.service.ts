@@ -7,6 +7,7 @@ export class LinkedinService {
     'full stack developer',
     'data scientist',
     'product manager',
+    // ... Add up to 100 keywords
     'software engineer',
     'machine learning engineer',
     'devops engineer',
@@ -24,28 +25,24 @@ export class LinkedinService {
     'systems administrator',
     'QA engineer',
     'technical writer',
-    // ... Continue adding up to 100 keywords
+    // Continue adding up to 100 keywords
   ];
 
   private readonly MAX_JOBS_PER_KEYWORD = 200;
   private readonly JOBS_PER_PAGE = 25; // LinkedIn displays 25 jobs per page
   private readonly MAX_JOB_AGE_DAYS = 30; // Filter out jobs older than 30 days
-  private readonly CONCURRENT_BROWSERS = 10; // Number of browser instances to run concurrently
+  private readonly MAX_CONCURRENT_PAGES = 5; // Limit for concurrent job detail pages
 
-  /**
-   * Launches a new Puppeteer browser instance.
-   */
   private async launchBrowser(): Promise<puppeteer.Browser> {
     return await puppeteer.launch({
-      headless: true,
+      headless: false,
+      slowMo: 0,
+      executablePath: '/usr/bin/google-chrome',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--start-maximized'],
       defaultViewport: null,
     });
   }
 
-  /**
-   * Fetches job URLs for a given keyword and start index.
-   */
   private async getJobHrefs(page: puppeteer.Page, keyword: string, start: number): Promise<string[]> {
     const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&start=${start}`;
 
@@ -72,9 +69,6 @@ export class LinkedinService {
     return jobHrefs;
   }
 
-  /**
-   * Scrapes detailed information from a job posting.
-   */
   private async scrapeJobDetails(jobHref: string, browser: puppeteer.Browser): Promise<any> {
     const jobPage = await browser.newPage();
     try {
@@ -84,7 +78,7 @@ export class LinkedinService {
       const jobDetails = await jobPage.evaluate(() => {
         const getTextContent = (selector: string): string => {
           const element = document.querySelector(selector);
-          return element ? element.textContent.trim() : 'Not specified';
+          return element ? element.textContent.trim() : '';
         };
 
         const getAttribute = (selector: string, attribute: string): string => {
@@ -132,15 +126,12 @@ export class LinkedinService {
     }
   }
 
-  /**
-   * Categorizes jobs based on the country extracted from the location.
-   */
   private categorizeByCountry(jobs: any[]): { [country: string]: any[] } {
     const categorizedJobs: { [country: string]: any[] } = {};
 
     jobs.forEach((job) => {
-      const countryMatch = job.location.match(/,\s*(\w+)$/);
-      const country = countryMatch ? countryMatch[1] : 'Unknown';
+      const countryMatch = job.location.match(/,\s*([A-Za-z\s]+)$/);
+      const country = countryMatch ? countryMatch[1].trim() : 'Unknown';
 
       if (!categorizedJobs[country]) {
         categorizedJobs[country] = [];
@@ -151,14 +142,11 @@ export class LinkedinService {
     return categorizedJobs;
   }
 
-  /**
-   * Filters out jobs that are older than the specified number of days.
-   */
   private filterOldJobs(jobs: any[]): any[] {
     const filteredJobs = jobs.filter((job) => {
       const postedBefore = job.postedBefore.toLowerCase();
 
-      if (postedBefore.includes('just now') || postedBefore.includes('minutes ago') || postedBefore.includes('hour ago') || postedBefore.includes('hours ago')) {
+      if (postedBefore.includes('just now') || postedBefore.includes('minute') || postedBefore.includes('hour')) {
         return true;
       }
 
@@ -180,108 +168,99 @@ export class LinkedinService {
     return filteredJobs;
   }
 
-  /**
-   * Distributes keywords evenly across a specified number of browsers.
-   */
-  private distributeKeywords(keywords: string[], numBrowsers: number): string[][] {
-    const distribution: string[][] = Array.from({ length: numBrowsers }, () => []);
-    keywords.forEach((keyword, index) => {
-      distribution[index % numBrowsers].push(keyword);
-    });
-    return distribution;
-  }
+  // Helper function to process an array with limited concurrency
+  private async processWithConcurrencyLimit<T>(items: T[], limit: number, asyncFn: (item: T) => Promise<any>): Promise<any[]> {
+    const results: any[] = [];
+    let index = 0;
 
-  /**
-   * Scrapes jobs for a given set of keywords using a single browser instance.
-   */
-  private async scrapeKeywordsWithBrowser(keywords: string[], browser: puppeteer.Browser): Promise<any[]> {
-    const detailedJobs = [];
-
-    for (const keyword of keywords) {
-      console.log(`Browser ${browser.process().pid}: Starting keyword "${keyword}"`);
-      let jobsCollected = 0;
-      let start = 0;
-      const keywordJobs = [];
-
-      while (jobsCollected < this.MAX_JOBS_PER_KEYWORD) {
+    const execute = async () => {
+      while (index < items.length) {
+        const currentIndex = index++;
         try {
-          const page = await browser.newPage();
-          const jobHrefs = await this.getJobHrefs(page, keyword, start);
-          await page.close();
-
-          // Remove duplicates
-          const newJobHrefs = jobHrefs.filter((href) => !keywordJobs.some((job) => job.href === href));
-
-          if (newJobHrefs.length === 0) {
-            // No new jobs found, break the loop
-            break;
-          }
-
-          // Scrape job details in parallel
-          const scrapeJobPromises = newJobHrefs.map((href) => this.scrapeJobDetails(href, browser));
-          const jobDetailsArray = await Promise.all(scrapeJobPromises);
-
-          keywordJobs.push(...jobDetailsArray);
-          jobsCollected += newJobHrefs.length;
-          start += this.JOBS_PER_PAGE;
-
-          console.log(`Browser ${browser.process().pid}: Collected ${jobsCollected} jobs for keyword "${keyword}"`);
-
-          // Optional delay to prevent rate limiting
-          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const result = await asyncFn(items[currentIndex]);
+          results[currentIndex] = result;
         } catch (error) {
-          console.error(`Browser ${browser.process().pid}: Error processing keyword "${keyword}" at start ${start}: ${error}`);
-          break;
+          console.error(`Error processing item at index ${currentIndex}: ${error}`);
+          results[currentIndex] = { error: `Failed to process item at index ${currentIndex}` };
         }
       }
+    };
 
-      // Filter out old jobs
-      const filteredJobs = this.filterOldJobs(keywordJobs);
+    // Create an array of worker promises
+    const workers = Array.from({ length: limit }, () => execute());
 
-      // Categorize by country
-      const categorizedJobs = this.categorizeByCountry(filteredJobs);
+    // Wait for all workers to finish
+    await Promise.all(workers);
 
-      detailedJobs.push({
-        keyword,
-        jobs: categorizedJobs,
-      });
-    }
-
-    return detailedJobs;
+    return results;
   }
 
-  /**
-   * Main function to scrape jobs using multiple browsers concurrently.
-   */
-  async scrapeJobs(): Promise<any[]> {
-    // Distribute keywords across the number of browsers
-    const keywordBatches = this.distributeKeywords(this.keywords, this.CONCURRENT_BROWSERS);
-
-    // Launch browsers
-    const browserPromises = Array.from({ length: this.CONCURRENT_BROWSERS }, () => this.launchBrowser());
-    const browsers = await Promise.all(browserPromises);
-
-    console.log(`Launched ${browsers.length} browser instances.`);
+  async scrapeJobs(): Promise<any> {
+    const browser = await this.launchBrowser();
+    const allJobs: any[] = [];
 
     try {
-      // Assign each batch of keywords to a browser
-      const scrapePromises = keywordBatches.map((keywords, index) => this.scrapeKeywordsWithBrowser(keywords, browsers[index]));
+      for (const keyword of this.keywords) {
+        console.log(`Scraping jobs for keyword: "${keyword}"`);
+        let jobsCollected = 0;
+        let start = 0;
+        const keywordJobs: any[] = [];
 
-      // Wait for all browsers to finish scraping
-      const results = await Promise.all(scrapePromises);
+        while (jobsCollected < this.MAX_JOBS_PER_KEYWORD) {
+          const page = await browser.newPage();
+          try {
+            const jobHrefs = await this.getJobHrefs(page, keyword, start);
 
-      // Flatten the results
-      const allJobs = results.flat();
+            // Remove duplicates
+            const newJobHrefs = jobHrefs.filter((href) => !keywordJobs.some((job) => job.href === href));
 
-      return allJobs;
+            if (newJobHrefs.length === 0) {
+              // No new jobs found, break the loop
+              console.log(`No more new jobs found for keyword "${keyword}" at start ${start}.`);
+              break;
+            }
+
+            console.log(`Found ${newJobHrefs.length} new job(s) for keyword "${keyword}".`);
+
+            // Scrape job details with controlled concurrency
+            const jobDetailsArray = await this.processWithConcurrencyLimit(newJobHrefs, this.MAX_CONCURRENT_PAGES, (href) => this.scrapeJobDetails(href, browser));
+
+            keywordJobs.push(...jobDetailsArray);
+            jobsCollected += newJobHrefs.length;
+            start += this.JOBS_PER_PAGE;
+
+            console.log(`Collected ${jobsCollected} jobs for keyword "${keyword}".`);
+
+            // Optional delay to prevent rate limiting
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          } catch (error) {
+            console.error(`Error processing keyword "${keyword}" at start ${start}: ${error}`);
+            break;
+          } finally {
+            await page.close();
+          }
+        }
+
+        // Filter out old jobs
+        const filteredJobs = this.filterOldJobs(keywordJobs);
+        console.log(`After filtering, ${filteredJobs.length} jobs remain for keyword "${keyword}".`);
+
+        // Categorize by country
+        const categorizedJobs = this.categorizeByCountry(filteredJobs);
+
+        allJobs.push({
+          keyword,
+          jobs: categorizedJobs,
+        });
+
+        console.log(`Finished scraping for keyword "${keyword}".`);
+      }
     } catch (error) {
-      console.error(`Error during scraping: ${error}`);
-      return [];
+      console.error(`Unexpected error during scraping: ${error}`);
     } finally {
-      // Close all browsers
-      const closePromises = browsers.map((browser) => browser.close());
-      await Promise.all(closePromises);
-      console.log(`All browsers closed.`);
+      await browser.close();
     }
+
+    return allJobs;
   }
 }
