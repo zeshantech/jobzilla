@@ -1,13 +1,17 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import * as puppeteer from 'puppeteer';
+import { ConfigService } from '@nestjs/config';
+import { ZenRows } from 'zenrows';
+import axios from 'axios';
 
 @Injectable()
 export class LinkedinService {
+  private readonly logger = new Logger(LinkedinService.name);
+
   private readonly keywords = [
     'full stack developer',
     'data scientist',
     'product manager',
-
     'software engineer',
     'machine learning engineer',
     'devops engineer',
@@ -32,44 +36,89 @@ export class LinkedinService {
   private readonly MAX_JOB_AGE_DAYS = 30;
   private readonly MAX_CONCURRENT_PAGES = 5;
 
-  private async launchBrowser(): Promise<puppeteer.Browser> {
-    return await puppeteer.launch({
-      headless: false,
-      slowMo: 0,
-      executablePath: '/usr/bin/google-chrome',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--start-maximized'],
-      defaultViewport: null,
-    });
+  constructor(private configService: ConfigService) {
+    const apiKey = this.configService.get<string>('ZENROWS_API_KEY');
+    if (!apiKey) {
+      throw new Error('ZenRows API key is not set. Please define ZENROWS_API_KEY in your environment variables.');
+    }
   }
 
-  private async getJobHrefs(page: puppeteer.Page, keyword: string, start: number): Promise<string[]> {
-    const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&start=${start}`;
-
-    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
-
-    await page.waitForSelector('.job-search-card');
-
-    const jobHrefs = await page.evaluate(() => {
-      const jobElements = document.querySelectorAll('.job-search-card');
-      const jobData: string[] = [];
-
-      jobElements.forEach((job) => {
-        const jobHref = job.querySelector('a.base-card__full-link')?.getAttribute('href') || '';
-        if (jobHref) {
-          jobData.push(jobHref);
-        }
+  private async fetchPage(url: string): Promise<string | null> {
+    try {
+      const data = await axios({
+        url: 'https://api.zenrows.com/v1/',
+        method: 'GET',
+        params: {
+          url: url,
+          apikey: this.configService.get<string>('ZENROWS_API_KEY'),
+          js_render: 'true',
+          premium_proxy: 'true',
+        },
       });
 
-      return jobData;
-    });
+      return data.data;
+    } catch (error: any) {
+      if (error.response) {
+        this.logger.error(`Error to fetching by proxy (${url}):`, error.message);
+        return null;
+      }
+    }
+  }
 
-    return jobHrefs;
+  private async launchBrowser(): Promise<puppeteer.Browser> {
+    try {
+      const browser = await puppeteer.launch({
+        headless: true,
+        executablePath: '/usr/bin/google-chrome',
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      });
+      return browser;
+    } catch (error: any) {
+      this.logger.error('Error launching Puppeteer browser:', error.message);
+      throw error;
+    }
+  }
+
+  private async getJobHrefs(htmlContent: string, keyword: string, browser: puppeteer.Browser): Promise<string[]> {
+    const page = await browser.newPage();
+    try {
+      await page.setContent(htmlContent, { waitUntil: 'domcontentloaded' });
+      await page.waitForSelector('.job-search-card', { timeout: 10000 });
+
+      const jobHrefs = await page.evaluate(() => {
+        const jobElements = document.querySelectorAll('.job-search-card');
+        const jobData: string[] = [];
+
+        jobElements.forEach((job) => {
+          const jobHref = job.querySelector('a.base-card__full-link')?.getAttribute('href') || '';
+          if (jobHref) {
+            jobData.push(jobHref);
+          }
+        });
+
+        return jobData;
+      });
+
+      this.logger.log(`Extracted ${jobHrefs.length} job links for keyword "${keyword}".`);
+      return jobHrefs;
+    } catch (error: any) {
+      this.logger.error(`Error extracting job hrefs for keyword "${keyword}":`, error.message);
+      return [];
+    } finally {
+      await page.close();
+    }
   }
 
   private async scrapeJobDetails(jobHref: string, browser: puppeteer.Browser): Promise<any> {
     const jobPage = await browser.newPage();
     try {
-      await jobPage.goto(jobHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      const htmlContent = await this.fetchPage(jobHref);
+
+      if (!htmlContent) {
+        throw new Error('Failed to fetch job page content.');
+      }
+
+      await jobPage.setContent(htmlContent, { waitUntil: 'domcontentloaded' });
       await jobPage.waitForSelector('.details.mx-details-container-padding', { timeout: 15000 });
 
       const jobDetails = await jobPage.evaluate(() => {
@@ -114,9 +163,10 @@ export class LinkedinService {
       });
 
       jobDetails['href'] = jobHref;
+      this.logger.log(`Scraped job details for: ${jobHref}`);
       return jobDetails;
-    } catch (error) {
-      console.error(`Error scraping job at: ${jobHref} - ${error}`);
+    } catch (error: any) {
+      this.logger.error(`Error scraping job at: ${jobHref} - ${error.message}`);
       return { error: `Failed to scrape job: ${jobHref}`, href: jobHref };
     } finally {
       await jobPage.close();
@@ -175,8 +225,8 @@ export class LinkedinService {
         try {
           const result = await asyncFn(items[currentIndex]);
           results[currentIndex] = result;
-        } catch (error) {
-          console.error(`Error processing item at index ${currentIndex}: ${error}`);
+        } catch (error: any) {
+          this.logger.error(`Error processing item at index ${currentIndex}: ${error.message}`);
           results[currentIndex] = { error: `Failed to process item at index ${currentIndex}` };
         }
       }
@@ -190,49 +240,51 @@ export class LinkedinService {
   }
 
   async scrapeJobs(): Promise<any> {
-    const browser = await this.launchBrowser();
     const allJobs: any[] = [];
+    const browser = await this.launchBrowser();
 
     try {
       for (const keyword of this.keywords) {
-        console.log(`Scraping jobs for keyword: "${keyword}"`);
+        this.logger.log(`\nScraping jobs for keyword: "${keyword}"`);
         let jobsCollected = 0;
         let start = 0;
         const keywordJobs: any[] = [];
 
         while (jobsCollected < this.MAX_JOBS_PER_KEYWORD) {
-          const page = await browser.newPage();
-          try {
-            const jobHrefs = await this.getJobHrefs(page, keyword, start);
+          const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&start=${start}`;
 
-            const newJobHrefs = jobHrefs.filter((href) => !keywordJobs.some((job) => job.href === href));
+          this.logger.log(`Fetching job search page: ${searchUrl}`);
+          const htmlContent = await this.fetchPage(searchUrl);
 
-            if (newJobHrefs.length === 0) {
-              console.log(`No more new jobs found for keyword "${keyword}" at start ${start}.`);
-              break;
-            }
-
-            console.log(`Found ${newJobHrefs.length} new job(s) for keyword "${keyword}".`);
-
-            const jobDetailsArray = await this.processWithConcurrencyLimit(newJobHrefs, this.MAX_CONCURRENT_PAGES, (href) => this.scrapeJobDetails(href, browser));
-
-            keywordJobs.push(...jobDetailsArray);
-            jobsCollected += newJobHrefs.length;
-            start += this.JOBS_PER_PAGE;
-
-            console.log(`Collected ${jobsCollected} jobs for keyword "${keyword}".`);
-
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          } catch (error) {
-            console.error(`Error processing keyword "${keyword}" at start ${start}: ${error}`);
+          if (!htmlContent) {
+            this.logger.error(`Failed to retrieve job search page for keyword "${keyword}" at start ${start}.`);
             break;
-          } finally {
-            await page.close();
           }
+
+          const jobHrefs = await this.getJobHrefs(htmlContent, keyword, browser);
+
+          const newJobHrefs = jobHrefs.filter((href) => !keywordJobs.some((job) => job.href === href));
+
+          if (newJobHrefs.length === 0) {
+            this.logger.log(`No more new jobs found for keyword "${keyword}" at start ${start}.`);
+            break;
+          }
+
+          this.logger.log(`Found ${newJobHrefs.length} new job(s) for keyword "${keyword}".`);
+
+          const jobDetailsArray = await this.processWithConcurrencyLimit(newJobHrefs, this.MAX_CONCURRENT_PAGES, async (href) => this.scrapeJobDetails(href, browser));
+
+          keywordJobs.push(...jobDetailsArray);
+          jobsCollected += newJobHrefs.length;
+          start += this.JOBS_PER_PAGE;
+
+          this.logger.log(`Collected ${jobsCollected} jobs for keyword "${keyword}".`);
+
+          await new Promise((resolve) => setTimeout(resolve, 2000));
         }
 
         const filteredJobs = this.filterOldJobs(keywordJobs);
-        console.log(`After filtering, ${filteredJobs.length} jobs remain for keyword "${keyword}".`);
+        this.logger.log(`After filtering, ${filteredJobs.length} jobs remain for keyword "${keyword}".`);
 
         const categorizedJobs = this.categorizeByCountry(filteredJobs);
 
@@ -241,10 +293,10 @@ export class LinkedinService {
           jobs: categorizedJobs,
         });
 
-        console.log(`Finished scraping for keyword "${keyword}".`);
+        this.logger.log(`Finished scraping for keyword "${keyword}".`);
       }
-    } catch (error) {
-      console.error(`Unexpected error during scraping: ${error}`);
+    } catch (error: any) {
+      this.logger.error(`Unexpected error during scraping: ${error.message}`);
     } finally {
       await browser.close();
     }
